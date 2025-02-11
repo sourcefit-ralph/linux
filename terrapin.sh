@@ -1,14 +1,15 @@
 #!/bin/bash
-# Terrapin Vulnerability Scanner Automation Script for Debian
-# Note: This scanner expects the target SSH server to support modern key exchange 
-# algorithms. If the target only offers legacy methods (e.g., diffie-hellman-group-exchange-sha1
-# or diffie-hellman-group14-sha1), the handshake will fail and the scanner may panic.
+# Improved Terrapin Vulnerability Scanner Automation Script for Debian
+# This script checks for required commands and installs the corresponding packages
+# only if they are missing. For example, if "go" is missing, it installs "golang-go".
 #
-# This script updates the system, installs required dependencies and the Terrapin-Scanner (if needed),
-# prompts for IP addresses to scan, runs the scans in the background, and displays nicely formatted JSON results.
-# Extra output before the JSON (if any) is stripped using sed to avoid jq parsing errors.
+# It then verifies that Terrapin-Scanner is installed and performs the scan.
+# (Extra output is filtered so that only the valid JSON portion is passed to jq.)
+#
+# Note: If the target SSH server only supports legacy key exchange methods,
+# Terrapin-Scanner may panic due to a failed handshake.
 
-# Check for root privileges (required for apt-get installs)
+# Ensure the script is run as root
 if [ "$(id -u)" -ne 0 ]; then
     echo "[!] Please run this script as root (e.g., using sudo)."
     exit 1
@@ -19,35 +20,50 @@ echo " Terrapin Vulnerability Scanner Automation Script"
 echo "--------------------------------------------------"
 echo ""
 
-# Step 1: Update package list and install dependencies
-echo "[*] Updating package list..."
-apt-get update -y
+# Define a mapping of command names to package names (for apt-get installation)
+declare -A pkg_map
+pkg_map=(
+    ["wget"]="wget"
+    ["git"]="git"
+    ["go"]="golang-go"
+    ["jq"]="jq"
+)
 
-echo "[*] Installing dependencies: wget, git, golang-go, jq..."
-apt-get install -y wget git golang-go jq
+# List of required commands to check for
+required_commands=("wget" "git" "go" "jq")
 
-# Verify that Go is installed
+# Check for missing dependencies
+missing_pkgs=()
+for cmd in "${required_commands[@]}"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        missing_pkgs+=("${pkg_map[$cmd]}")
+    fi
+done
+
+if [ ${#missing_pkgs[@]} -gt 0 ]; then
+    echo "[*] The following dependencies are missing: ${missing_pkgs[*]}"
+    echo "[*] Updating package list and installing missing dependencies..."
+    apt-get update -qq
+    apt-get install -y "${missing_pkgs[@]}"
+fi
+
+# Verify that Go is available after installation
 if ! command -v go >/dev/null 2>&1; then
-    echo "[!] Golang installation failed. Exiting."
+    echo "[!] Go is required but is still not installed. Exiting."
     exit 1
 fi
 
-# Step 2: Check for Terrapin-Scanner; if not found, install it via 'go install'
-if command -v Terrapin-Scanner >/dev/null 2>&1; then
-    echo "[*] Terrapin-Scanner is already installed."
-else
-    echo "[*] Terrapin-Scanner not found. Installing via 'go install'..."
-    # Set up Go environment variables
+# Check for Terrapin-Scanner; if missing, install it via go install.
+if ! command -v Terrapin-Scanner >/dev/null 2>&1; then
+    echo "[*] Installing Terrapin-Scanner via 'go install'..."
     export GOPATH="$HOME/go"
     export GOBIN="$GOPATH/bin"
     mkdir -p "$GOPATH"
     go install github.com/RUB-NDS/Terrapin-Scanner@latest
-
     if [ -f "$GOBIN/Terrapin-Scanner" ]; then
          echo "[*] Terrapin-Scanner installed successfully at $GOBIN/Terrapin-Scanner."
-         # Add GOBIN to PATH if not already present (for the current session)
+         # Add GOBIN to PATH for current session if not already present
          if [[ ":$PATH:" != *":$GOBIN:"* ]]; then
-             echo "[*] Adding $GOBIN to PATH for current session."
              export PATH="$PATH:$GOBIN"
          fi
     else
@@ -59,7 +75,7 @@ fi
 echo "[*] All dependencies and Terrapin-Scanner are ready."
 echo ""
 
-# Step 3: Prompt user for IP address(es) to scan
+# Prompt user for IP address(es) to scan
 read -p "Enter IP address(es) to scan (separated by spaces): " -a ip_array
 if [ ${#ip_array[@]} -eq 0 ]; then
     echo "[!] No IP addresses provided. Exiting."
@@ -71,19 +87,18 @@ echo "[*] Starting Terrapin vulnerability scans..."
 
 # Create a temporary directory for scan output files
 temp_dir=$(mktemp -d -t terrapin_scan_XXXX)
-echo "[*] Temporary directory for scan outputs: $temp_dir"
 
 # Function to scan a single IP address
 scan_ip() {
     local ip=$1
     echo "[*] Scanning ${ip}:22..."
     # Run the scanner in JSON output mode.
-    # Redirect stderr to /dev/null and use sed to extract only the valid JSON part (starting with '{' or '[').
+    # Redirect stderr to /dev/null and use sed to output only lines starting with '{' or '['
     Terrapin-Scanner --connect "${ip}:22" --json 2>/dev/null | sed -n '/^[{[]/,$p' > "$temp_dir/scan_${ip}.json" 2>&1
     echo "[*] Scan for ${ip} complete."
 }
 
-# Step 4: Launch scans in background for each IP
+# Launch scans in background for each IP
 for ip in "${ip_array[@]}"; do
     scan_ip "$ip" &
 done
@@ -93,7 +108,7 @@ wait
 
 echo ""
 echo "----------------- Scan Results -------------------"
-# Step 5: Display the results in a readable format
+# Display the results in a readable format
 for ip in "${ip_array[@]}"; do
     echo "Results for ${ip}:"
     file="$temp_dir/scan_${ip}.json"
